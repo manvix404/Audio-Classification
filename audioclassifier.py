@@ -115,3 +115,80 @@ yhat = model.predict(X_test)
 
 #convert logits to classes
 yhat = [1 if prediction > 0.5 else 0 for prediction in yhat]
+
+#load mp3
+def load_mp3_16k_mono(filename):
+    """ Load a WAV file, convert it to a float tensor, resample to 16 kHz single-channel audio. """
+    res = tfio.audio.AudioIOTensor(filename)
+    # Convert to tensor and combine channels 
+    tensor = res.to_tensor()
+    tensor = tf.math.reduce_sum(tensor, axis=1) / 2 
+    # Extract sample rate and cast
+    sample_rate = res.rate
+    sample_rate = tf.cast(sample_rate, dtype=tf.int64)
+    # Resample to 16 kHz
+    wav = tfio.audio.resample(tensor, rate_in=sample_rate, rate_out=16000)
+    return wav
+
+mp3 = os.path.join('data', 'Forest Recordings', 'recording_00.mp3')
+wav = load_mp3_16k_mono(mp3)
+audio_slices = tf.keras.utils.timeseries_dataset_from_array(wav, wav, sequence_length=48000, sequence_stride=48000, batch_size=1)
+samples, index = audio_slices.as_numpy_iterator().next()
+
+#clips into windowed spectrogram
+def preprocess_mp3(sample, index):
+    sample = sample[0]
+    zero_padding = tf.zeros([48000] - tf.shape(sample), dtype=tf.float32)
+    wav = tf.concat([zero_padding, sample],0)
+    spectrogram = tf.signal.stft(wav, frame_length=320, frame_step=32)
+    spectrogram = tf.abs(spectrogram)
+    spectrogram = tf.expand_dims(spectrogram, axis=2)
+    return spectrogram
+
+#Convert Longer Clips into Windows and Make Predictions
+audio_slices = tf.keras.utils.timeseries_dataset_from_array(wav, wav, sequence_length=16000, sequence_stride=16000, batch_size=1)
+audio_slices = audio_slices.map(preprocess_mp3)
+audio_slices = audio_slices.batch(64)
+yhat = model.predict(audio_slices)
+yhat = [1 if prediction > 0.99 else 0 for prediction in yhat]
+
+#group consecutive detections
+from itertools import groupby
+yhat = [key for key, group in groupby(yhat)]
+calls = tf.math.reduce_sum(yhat).numpy()
+calls
+
+#loop through all recordings and make predictions
+results = {}
+for file in os.listdir(os.path.join('Forest Recordings')):
+    FILEPATH = os.path.join('Forest Recordings', file)
+    
+    wav = load_mp3_16k_mono(FILEPATH)
+    audio_slices = tf.keras.utils.timeseries_dataset_from_array(wav, wav, sequence_length=48000, sequence_stride=48000, batch_size=1)
+    audio_slices = audio_slices.map(preprocess_mp3)
+    audio_slices = audio_slices.batch(64)
+    
+    yhat = model.predict(audio_slices)
+    
+    results[file] = yhat
+results
+
+#convert predictions to classes
+class_preds = {}
+for file, logits in results.items():
+    class_preds[file] = [1 if prediction > 0.99 else 0 for prediction in logits]
+class_preds
+
+#group consecutive detections
+postprocessed = {}
+for file, scores in class_preds.items():
+    postprocessed[file] = tf.math.reduce_sum([key for key, group in groupby(scores)]).numpy()
+postprocessed
+
+#export to csv
+import csv
+with open('results.csv', 'w', newline='') as f:
+    writer = csv.writer(f, delimiter=',')
+    writer.writerow(['recording', 'capuchin_calls'])
+    for key, value in postprocessed.items():
+        writer.writerow([key, value])
